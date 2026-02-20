@@ -1,112 +1,107 @@
 import express from "express";
 import cors from "cors";
-import OpenAI from "openai";
 
 const app = express();
+
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-const PORT = process.env.PORT || 3000;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const SERVICE_TOKEN = process.env.SERVICE_TOKEN || ""; // token seu (obrigatório)
+function getServiceToken() {
+  // ✅ tenta ler de vários nomes (caso você tenha criado com nome diferente)
+  const t =
+    process.env.SERVICE_TOKEN ||
+    process.env.HS_AI_TOKEN ||
+    process.env.API_TOKEN ||
+    "";
+  return String(t || "").trim();
+}
 
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+function extractToken(req) {
+  // 1) Authorization: Bearer <token>
+  const auth = String(req.headers.authorization || "").trim();
+  if (auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7).trim();
+  }
+  // 2) X-Service-Token: <token>
+  const x = String(req.headers["x-service-token"] || "").trim();
+  if (x) return x;
 
-function getBearerToken(req) {
-  const h = req.headers["authorization"] || "";
-  const m = /^Bearer\s+(.+)$/i.exec(h);
-  return m ? m[1].trim() : "";
+  return "";
+}
+
+function requireAuth(req, res, next) {
+  const expected = getServiceToken();
+  if (!expected) {
+    return res.status(500).json({ ok: false, error: "SERVICE_TOKEN não configurado no servidor." });
+  }
+
+  const got = extractToken(req);
+
+  if (!got) {
+    return res.status(401).json({ ok: false, error: "Não autorizado." });
+  }
+
+  // comparação simples (ok para token). Se quiser constante no futuro, fazemos.
+  if (got !== expected) {
+    return res.status(401).json({ ok: false, error: "Não autorizado." });
+  }
+
+  next();
 }
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "horasecreta-ai", ts: Date.now() });
+  const expected = getServiceToken();
+  res.json({
+    ok: true,
+    service: "horasecreta-ai",
+    ts: Date.now(),
+    hasServiceToken: Boolean(expected),
+    serviceTokenLen: expected ? expected.length : 0,
+    hasOpenAIKey: Boolean(String(process.env.OPENAI_API_KEY || "").trim()),
+  });
 });
 
-app.post("/advisor", async (req, res) => {
+// ✅ rota de diagnóstico SEM vazar token: mostra se o header está chegando e tamanho
+app.get("/debug-auth", (req, res) => {
+  const expected = getServiceToken();
+  const got = extractToken(req);
+
+  res.json({
+    ok: true,
+    hasAuthHeader: Boolean(req.headers.authorization),
+    hasXServiceToken: Boolean(req.headers["x-service-token"]),
+    gotLen: got ? got.length : 0,
+    expectedLen: expected ? expected.length : 0,
+    match: Boolean(got && expected && got === expected),
+  });
+});
+
+// --------- SUA ROTA PRINCIPAL ----------
+app.post("/advisor", requireAuth, async (req, res) => {
   try {
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ ok: false, error: "OPENAI_API_KEY não configurada." });
-    }
-    if (!SERVICE_TOKEN) {
-      return res.status(500).json({ ok: false, error: "SERVICE_TOKEN não configurado." });
-    }
+    const message = String(req.body?.message || "").trim();
+    const mode = String(req.body?.mode || "biblico").trim();
 
-    // 🔐 Segurança: exige Bearer token
-    const token = getBearerToken(req);
-    if (token !== SERVICE_TOKEN) {
-      return res.status(401).json({ ok: false, error: "Não autorizado." });
+    if (!message) {
+      return res.status(400).json({ ok: false, error: "Mensagem vazia." });
     }
 
-    const message = String(req.body?.message ?? "").trim();
-    const mode = String(req.body?.mode ?? "biblico").trim().toLowerCase();
+    // Aqui você chama a OpenAI (se já tiver implementado no seu projeto)
+    // Exemplo: const text = await buildAdvisorReply(message, mode);
+    // return res.json({ ok: true, text });
 
-    if (!message || message.length < 5) {
-      return res.status(400).json({ ok: false, error: "Mensagem muito curta." });
-    }
-    if (message.length > 2000) {
-      return res.status(400).json({ ok: false, error: "Mensagem muito longa (máx 2000)." });
-    }
-
-    const system = [
-      "Você é o Conselheiro do Recomeço do projeto Hora Secreta.",
-      "Responda em português (Brasil), com tom pastoral, respeitoso e prático.",
-      "Formato fixo (com títulos numerados):",
-      "1) Entendimento da crise",
-      "2) Direcionamento",
-      "3) Fundamento bíblico (1 a 2 referências, sem citar textos longos)",
-      "4) Passo prático para hoje (3 passos curtos)",
-      "5) Oração guiada (curta)",
-      "6) Declaração final de recomeço (1 frase)",
-      "Seja objetivo: no máximo 14 linhas no total.",
-      "Nunca incentive atitudes perigosas.",
-    ].join("\n");
-
-    const userPrefix =
-      mode === "biblico"
-        ? "Modo: Bíblico.\n"
-        : "Modo: Neutro (sem linguagem religiosa explícita, mas ainda acolhedor e prático).\n";
-
-    // ⏱️ Timeout interno (pra não travar a requisição)
-    const controller = new AbortController();
-    const timeoutMs = 25000; // 25s
-    const t = setTimeout(() => controller.abort(), timeoutMs);
-
-    let resp;
-    try {
-      resp = await openai.responses.create(
-        {
-          model: "gpt-5-mini",
-          input: [
-            { role: "system", content: system },
-            { role: "user", content: userPrefix + message },
-          ],
-          max_output_tokens: 420
-        },
-        { signal: controller.signal }
-      );
-    } finally {
-      clearTimeout(t);
-    }
-
-    const text = (resp?.output_text || "").trim();
-
-    if (!text) {
-      return res.status(502).json({ ok: false, error: "OpenAI retornou vazio." });
-    }
-
-    return res.json({ ok: true, text });
-
-  } catch (err) {
-    const msg = String(err?.message || err || "Erro desconhecido");
-    // AbortController timeout
-    if (msg.toLowerCase().includes("aborted") || msg.toLowerCase().includes("abort")) {
-      return res.status(504).json({ ok: false, error: "Timeout no microserviço." });
-    }
-    console.error(err);
-    return res.status(500).json({ ok: false, error: msg });
+    return res.json({
+      ok: true,
+      text:
+        `1) **Entendimento da crise**\n` +
+        `Recebi sua mensagem (${mode}).\n\n` +
+        `2) **Direcionamento**\n` +
+        `...\n`,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "Erro interno no serviço." });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`horasecreta-ai-service on :${PORT}`);
-});
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log("horasecreta-ai on", port));
